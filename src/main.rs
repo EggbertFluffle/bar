@@ -1,14 +1,13 @@
 use std::{convert::TryInto, num::NonZeroU32};
 
+use fontdue::{Font, FontSettings, Metrics};
+
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    seat::{
-        Capability, SeatHandler, SeatState,
-    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -21,7 +20,7 @@ use smithay_client_toolkit::{
 
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_output, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -72,16 +71,16 @@ fn main() {
     let pool = SlotPool::new(1920 * 60 * 4, &shm)
         .expect("Failed to create pool");
 
+    let glyph_cache = GlyphCache::new("./Iosevka.ttc", 52.0).unwrap();
+
     let mut simple_layer = SimpleLayer {
-        // Seats and outputs may be hotplugged at runtime, therefore we need to setup a registry state to
-        // listen for seats and outputs.
         registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
 
         exit: false,
         first_configure: true,
+        glyph_cache: glyph_cache,
         pool,
         width: 256,
         height: 256,
@@ -101,13 +100,13 @@ fn main() {
 
 struct SimpleLayer {
     registry_state: RegistryState,
-    seat_state: SeatState,
     output_state: OutputState,
     shm: Shm,
 
     exit: bool,
     first_configure: bool,
     pool: SlotPool,
+    glyph_cache: GlyphCache,
     width: u32,
     height: u32,
     layer: LayerSurface
@@ -210,32 +209,6 @@ impl LayerShellHandler for SimpleLayer {
     }
 }
 
-impl SeatHandler for SimpleLayer {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-
-    fn new_capability(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-        _capability: Capability,
-    ) { }
-
-    fn remove_capability(
-        &mut self,
-        _conn: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _capability: Capability,
-    ) { }
-
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-}
-
 impl ShmHandler for SimpleLayer {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -251,14 +224,7 @@ impl SimpleLayer {
         // Don't create a new buffer each time, only when output is resized
         let (buffer, canvas) = self.pool
             .create_buffer(width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888)
-            .expect("create buffer");
-
-        println!("Loading font");
-        let font_path = include_bytes!("../IosevkaNerdFont-Regular.ttf") as &[u8];
-        let font = fontdue::Font::from_bytes(font_path, fontdue::FontSettings::default()).unwrap();
-        println!("Font has been loaded");
-        let (metrics, bitmap) = font.rasterize('g', 36.0);
-        println!("Font has been rasterized");
+            .expect("Create buffer");
 
         {
             canvas.chunks_exact_mut(4).enumerate().for_each(|(_, chunk)| {
@@ -273,29 +239,24 @@ impl SimpleLayer {
             });
         }
 
-        dbg!(canvas.len());
-        dbg!(width);
-        dbg!(height);
-
-        for x in 0..width as usize {
-            for y in 0..height as usize {
-                canvas[y * stride as usize + (x * 4) + 0] = 0xFF;
-                canvas[y * stride as usize + (x * 4) + 1] = 0xFF;
-                canvas[y * stride as usize + (x * 4) + 2] = 0xFF;
-                canvas[y * stride as usize + (x * 4) + 3] = 0xFF;
-            }
-        }
-
-        for x in 0..metrics.width {
+        let kearning = 10;
+        let mut pen_x = 0;
+        for c in 'a'..='z' {
+            let (metrics, bitmap) = self.glyph_cache.get_or_rasterize(c);
+            
             for y in 0..metrics.height {
-                if bitmap[y * metrics.width + x] > (255 / 2) {
-                    canvas[y * stride as usize + (x * 4) + 0] = 0xFF;
-                    canvas[y * stride as usize + (x * 4) + 1] = 0x00;
-                    canvas[y * stride as usize + (x * 4) + 2] = 0x00;
-                    canvas[y * stride as usize + (x * 4) + 3] = 0x00;
+                for x in 0..metrics.width {
+                    let v = bitmap[y * metrics.width + x];
+                    if v == 0 { continue; }
+
+                    let px = y * stride as usize + ((x + pen_x) * 4);
+                    canvas[px..px + 4].copy_from_slice(&[v, v, v, 0xFF]);
                 }
             }
+
+            pen_x += metrics.width + kearning;
         }
+
 
         // We shouldn't damage the entire window
         // Damage the entire window
@@ -314,13 +275,37 @@ impl SimpleLayer {
     }
 }
 
+struct GlyphCache {
+    map: std::collections::HashMap<char, (Metrics, Vec<u8>)>,
+    px: f32,
+    font: Font
+}
+
+impl GlyphCache {
+    fn new(font_path: &str, px: f32) -> Result<Self, &'static str> {
+        let file = std::fs::read(font_path)
+            .map_err(|_| { "Unable to read file" })?;
+
+        Ok(GlyphCache { 
+            map: std::collections::HashMap::new(),
+            px: px,
+            font: Font::from_bytes(file, FontSettings::default())?
+        })   
+    }
+
+    fn get_or_rasterize(&mut self, character: char) -> &(Metrics, Vec<u8>) {
+        self.map.entry(character)
+            .or_insert(self.font.rasterize(character, self.px))
+    }
+}
+
 delegate_registry!(SimpleLayer);
 
 impl ProvidesRegistryState for SimpleLayer {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState, SeatState];
+    registry_handlers![OutputState];
 }
 
 smithay_client_toolkit::delegate_dispatch2!(SimpleLayer);
