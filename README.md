@@ -1,4 +1,12 @@
-= Ideation
+# Bar
+
+Currently using 
+
+- Smithay client toolkit - Wayland client tools
+- Fontdue - Font parsing and glyph rasterizing
+- Lua? - configuration and extension
+
+# Ideation
 
 Lua or TOML config
 
