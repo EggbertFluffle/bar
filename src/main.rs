@@ -226,6 +226,8 @@ impl SimpleLayer {
             .create_buffer(width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888)
             .expect("Create buffer");
 
+        self.layer.set_exclusive_zone(height as i32);
+
         {
             canvas.chunks_exact_mut(4).enumerate().for_each(|(_, chunk)| {
                 let a = 0xFF;
